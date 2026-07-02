@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: bams-embedding-service
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: EMBEDDING_MODEL
+        value: BAAI/bge-small-en-v1.5
+      - key: PYTHON_VERSION
+        value: 3.12.0
