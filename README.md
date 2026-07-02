@@ -1,305 +1,67 @@
 # BAMS Embedding Service
 
-A dedicated FastAPI microservice that serves text embeddings for BAMS using [BGE Small](https://huggingface.co/BAAI/bge-small-en-v1.5). This service runs separately from the main BAMS API so the embedding model stays isolated, easy to scale, and simple to swap later.
+This repo is a small FastAPI service that turns text into embedding vectors for [BAMS](https://github.com/beysix/Beysix-Wms) (our Brand Asset Management System).
 
-## How to run an embedding model on Render
+BAMS is where teams track branded physical assets — tents, stages, coolers, signage, whatever gets moved between warehouses and sent out on activations. A single brand might have hundreds of items with messy names, partial descriptions, and photos. People search for things like "something Tusker-branded for an outdoor festival" rather than an exact SKU.
 
-This is one of the places where Render Workflows can be very useful.
+That is where embeddings come in.
 
-There are three ways to run embeddings on Render, and I recommend one over the others for BAMS.
+## Why we need this
 
-### Option 1 (Recommended): Run an embedding API as a separate service
+Keyword search only gets you so far. If someone types "outdoor tent" but the asset is logged as "3x3m branded gazebo — green", a plain text match might miss it.
 
-Instead of embedding inside your main BAMS server, create a dedicated microservice.
+An embedding model reads the text and outputs a list of numbers (a vector) that captures meaning. Similar descriptions end up close together in that number space. We store those vectors in Postgres with pgvector, then use them for:
 
-```
-BAMS API
-     │
-     │ HTTP
-     ▼
-Embedding Service
-     │
-     ▼
-BGE Model
-```
+- **Semantic search** — find assets and activations by intent, not just exact words
+- **The in-app assistant** — retrieve relevant chunks of BAMS data before answering a question
+- **Future batch jobs** — grouping similar assets, surfacing things that are often used together, building recommendations overnight instead of on every click
 
-Your application simply calls:
+The model we run here is [BGE Small](https://huggingface.co/BAAI/bge-small-en-v1.5) (`BAAI/bge-small-en-v1.5`). It is small enough to run on CPU, good enough for English asset descriptions, and outputs **384-dimensional** vectors.
 
-```http
-POST /embed
-```
+## Why a separate service
 
-and gets back:
+We could load the model inside the main Django app, but that app already does a lot: multi-tenant schemas, activations, warehousing, finance, WhatsApp hooks, Celery workers. Pulling in `sentence-transformers` and a few hundred MB of model weights on every web dyno would slow cold starts and make deploys heavier for no good reason.
 
-```json
-{
-  "embedding": [0.024, -0.18, ...]
-}
-```
-
-This keeps the embedding model isolated and makes it easy to scale or swap models later.
-
-#### Step 1
-
-Create a new Render Web Service.
-
-Python is the easiest choice because the embedding ecosystem is excellent.
-
-Install:
-
-```bash
-pip install fastapi
-pip install uvicorn
-pip install sentence-transformers
-```
-
-#### Step 2
-
-Load the model once at startup.
-
-```python
-from sentence_transformers import SentenceTransformer
-
-model = SentenceTransformer(
-    "BAAI/bge-small-en-v1.5"
-)
-```
-
-This downloads the model the first time. After that it's cached.
-
-#### Step 3
-
-Create an endpoint.
-
-```python
-from fastapi import FastAPI
-
-app = FastAPI()
-
-@app.post("/embed")
-def embed(request: dict):
-
-    vector = model.encode(
-        request["text"],
-        normalize_embeddings=True
-    )
-
-    return {
-        "embedding": vector.tolist()
-    }
-```
-
-Done.
-
-#### Step 4
-
-Call it from BAMS.
-
-```javascript
-const response = await fetch(
-    "https://embeddings.yourdomain.com/embed",
-    {
-        method: "POST",
-        body: JSON.stringify({
-            text
-        }),
-        headers: {
-            "Content-Type": "application/json"
-        }
-    }
-);
-
-const embedding = await response.json();
-```
-
-### Option 2: Run it inside your existing backend
-
-If your backend is Node:
+So this runs on its own. BAMS calls it over HTTP when it needs a vector. If we swap models later, we change this repo — not the whole backend.
 
 ```
-Node API
- ├── Assets
- ├── Users
- ├── AI
- └── Python child process
+  BAMS (Django on Render)
+        │
+        │  POST /embed  { "text": "..." }
+        ▼
+  This service
+        │
+        │  BGE Small (loaded once at startup)
+        ▼
+  { "embedding": [0.024, -0.18, ...] }
+        │
+        ▼
+  Stored in Postgres / pgvector on the BAMS side
 ```
 
-Every time you need an embedding:
+Most of the heavy embedding work can also run in nightly jobs: find assets that changed today, batch-embed them, write vectors, move on. Users are not waiting on model inference during a normal page load.
 
-```
-Node
-   ↓
-Python
-   ↓
-Model
-   ↓
-Embedding
-```
+## How it works
 
-This works but becomes harder to maintain as traffic grows.
+1. **Startup** — `app.py` loads `BAAI/bge-small-en-v1.5` into memory once. First run downloads the weights from Hugging Face; after that they are cached on disk.
 
-### Option 3: Nightly Workflow (my favorite for BAMS)
+2. **Request** — BAMS (or a workflow script) sends JSON with a `text` field.
 
-Since you already plan to run AI jobs every night:
+3. **Encode** — `sentence-transformers` runs the text through the model with `normalize_embeddings=True` so vectors are unit length. That makes cosine similarity straightforward downstream.
 
-```
-00:00
-   │
-Workflow starts
-   │
-Find changed assets
-   │
-Generate embeddings
-   │
-Save vectors
-   │
-Generate categories
-   │
-Generate "works well together"
-   │
-Generate recommendations
-   │
-Done
-```
+4. **Response** — JSON with an `embedding` array of 384 floats.
 
-No user waits for embeddings. Everything is precomputed.
+For bulk work there is also `POST /embed/batch`, which accepts a `texts` array and returns all vectors in one round trip. Much faster than embedding items one by one during a nightly sync.
 
-## Hardware
+### Endpoints
 
-You do not need a GPU.
+| Method | Path | Body | Returns |
+|--------|------|------|---------|
+| `GET` | `/health` | — | `{ "status": "ok", "model": "..." }` |
+| `POST` | `/embed` | `{ "text": "..." }` | `{ "embedding": [...] }` |
+| `POST` | `/embed/batch` | `{ "texts": ["...", "..."] }` | `{ "embeddings": [[...], [...]] }` |
 
-Models like:
-
-- BGE Small
-- MiniLM
-- Nomic Embed
-
-run perfectly on CPU.
-
-Even a Render Starter instance can usually generate a few hundred embeddings per minute, depending on the model and hardware.
-
-## My recommendation for BAMS
-
-I'd build it like this:
-
-```
-                 Render
-
-        ┌────────────────────┐
-        │     BAMS API        │
-        └─────────┬───────────┘
-                  │
-                  │
-                  ▼
-        ┌────────────────────┐
-        │ Embedding Service  │
-        │ BGE Small          │
-        └─────────┬───────────┘
-                  │
-                  ▼
-             PostgreSQL
-             pgvector
-
-Every Midnight
-      │
-      ▼
-Render Workflow
-      │
-      ├── Embed new assets
-      ├── Cluster by similarity
-      ├── Generate AI categories
-      ├── Find assets used together
-      ├── Update recommendation tables
-      └── Finish
-```
-
-This architecture has a few advantages:
-
-- Your main API stays responsive because it never loads the embedding model.
-- The embedding service can be reused anywhere in BAMS (search, recommendations, AI categorization).
-- Nightly jobs handle most of the heavy work, so users aren't waiting on expensive computations.
-- If you later decide to switch from BGE to another model, you only change the embedding service without touching the rest of your application.
-
-For your expected workload, this is a clean and scalable design. You can also batch multiple texts into a single request (`model.encode([...])`) during the nightly workflow, which is much faster than embedding assets one at a time.
-
-## Do I create the embedding service on my localhost then push it to my server?
-
-Yes — exactly.
-
-Create it locally first, test it, then push it to GitHub and deploy it as a separate Render Web Service.
-
-```
-Local machine
-  ↓
-Create FastAPI embedding service
-  ↓
-Test /embed locally
-  ↓
-Push to GitHub
-  ↓
-Create Render Web Service from repo
-  ↓
-BAMS API calls Render embedding URL
-```
-
-## Project structure
-
-```
-bams-embedding-service/
-  app.py
-  requirements.txt
-  Dockerfile
-  render.yaml
-  README.md
-```
-
-## Run locally
-
-```bash
-cd bams-embedding-service
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app:app --host 0.0.0.0 --port 8000
-```
-
-The first startup downloads `BAAI/bge-small-en-v1.5` and caches it locally.
-
-### Test single embedding
-
-```bash
-curl -X POST http://localhost:8000/embed \
-  -H "Content-Type: application/json" \
-  -d '{"text":"Tusker branded outdoor tent"}'
-```
-
-### Test batch embeddings
-
-```bash
-curl -X POST http://localhost:8000/embed/batch \
-  -H "Content-Type: application/json" \
-  -d '{"texts":["Tusker branded outdoor tent","Festival stage backdrop"]}'
-```
-
-### Health check
-
-```bash
-curl http://localhost:8000/health
-```
-
-## Deploy to Render
-
-1. Push this repository to GitHub.
-2. Create a new Render Web Service from the repo.
-3. Use Docker or Python with this start command:
-
-```bash
-uvicorn app:app --host 0.0.0.0 --port $PORT
-```
-
-4. Set `EMBEDDING_MODEL` to `BAAI/bge-small-en-v1.5` if you want to override the default.
-
-Then your main BAMS backend calls:
+### Calling it from BAMS
 
 ```javascript
 const res = await fetch("https://your-embedding-service.onrender.com/embed", {
@@ -311,12 +73,76 @@ const res = await fetch("https://your-embedding-service.onrender.com/embed", {
 const { embedding } = await res.json();
 ```
 
-I'd keep this as a separate service, not inside your main BAMS API. That keeps your main server lighter and easier to scale.
+On the BAMS side, point vector search at this service and set `VECTOR_INDEX_EMBEDDING_DIMENSIONS=384` so pgvector column sizes match BGE Small.
 
-## Model notes
+## Run it locally
 
-- **Model:** `BAAI/bge-small-en-v1.5`
-- **Output dimensions:** 384
-- **Normalization:** embeddings are L2-normalized (`normalize_embeddings=True`)
+```bash
+cd bams-embedding-service
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
 
-When wiring this into BAMS vector search, set `VECTOR_INDEX_EMBEDDING_DIMENSIONS=384` to match BGE Small.
+First startup takes a minute while the model downloads.
+
+**Single text:**
+
+```bash
+curl -X POST http://localhost:8000/embed \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Tusker branded outdoor tent"}'
+```
+
+**Batch:**
+
+```bash
+curl -X POST http://localhost:8000/embed/batch \
+  -H "Content-Type: application/json" \
+  -d '{"texts":["Tusker branded outdoor tent","Festival stage backdrop"]}'
+```
+
+**Health:**
+
+```bash
+curl http://localhost:8000/health
+```
+
+## Deploy on Render
+
+Workflow we use:
+
+1. Push this repo to GitHub (its own repo — not bundled inside the main BAMS monorepo deploy).
+2. Create a **Web Service** on Render from that repo.
+3. Start command:
+
+   ```bash
+   uvicorn app:app --host 0.0.0.0 --port $PORT
+   ```
+
+   Or deploy with the included `Dockerfile` / `render.yaml`.
+
+4. Optional env var: `EMBEDDING_MODEL` (defaults to `BAAI/bge-small-en-v1.5`).
+
+No GPU required. A Starter instance on CPU is fine for our volume — think a few hundred embeddings per minute, more if you batch.
+
+Point `VECTOR_INDEX_EMBEDDING_BASE_URL` (or whatever URL BAMS uses for embeddings in production) at the Render service URL once it is live.
+
+## What's in the repo
+
+```
+app.py              # FastAPI app + model loading
+requirements.txt    # fastapi, uvicorn, sentence-transformers
+Dockerfile          # container build
+render.yaml         # Render blueprint
+```
+
+## Model reference
+
+| | |
+|---|---|
+| Model | `BAAI/bge-small-en-v1.5` |
+| Dimensions | 384 |
+| Normalization | L2-normalized at encode time |
+| Override | set `EMBEDDING_MODEL` env var |
