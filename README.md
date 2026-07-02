@@ -109,13 +109,34 @@ curl -X POST http://localhost:8000/embed/batch \
 curl http://localhost:8000/health
 ```
 
+## Logs on Render
+
+All logs go to stdout so you can tail them in the Render dashboard or CLI.
+
+```bash
+render logs -r bams-embedding-service --tail
+```
+
+Useful log lines:
+
+| Event | Example |
+|-------|---------|
+| Service boot | `service_starting model=...` |
+| Model loading | `model_load_started` → `model_load_complete` |
+| Health while loading | `health_check status=loading loading_ms=...` |
+| Single embed | `embed_request_started` → `embed_request_complete` |
+| Batch embed | `embed_batch_started` → `embed_batch_complete` |
+| HTTP summary | `http_request method=POST path=/embed/batch status=200 latency_ms=...` |
+
+Set `LOG_LEVEL=DEBUG` for more verbose health-check logs. Raw text is never logged — only counts and char lengths.
+
 ## Deploy on Render
 
 Workflow we use:
 
 1. Push this repo to GitHub (its own repo — not bundled inside the main BAMS monorepo deploy).
 2. Create a **Web Service** on Render from that repo.
-3. Start command:
+3. Start command (Dockerfile handles this automatically):
 
    ```bash
    uvicorn app:app --host 0.0.0.0 --port $PORT
@@ -126,6 +147,8 @@ Workflow we use:
 4. Optional env var: `EMBEDDING_MODEL` (defaults to `BAAI/bge-small-en-v1.5`).
 
 No GPU required. A Starter instance on CPU is fine for our volume — think a few hundred embeddings per minute, more if you batch.
+
+**Port binding:** Render requires the process to bind `0.0.0.0:$PORT` quickly. The app loads the model in a background thread so uvicorn opens the port immediately; `/health` returns `{"status":"loading"}` until the model is ready, then `{"status":"ok"}`. Model weights are pre-downloaded during the Docker build so boot does not hit Hugging Face.
 
 Point `VECTOR_INDEX_EMBEDDING_BASE_URL` (or whatever URL BAMS uses for embeddings in production) at the Render service URL once it is live.
 

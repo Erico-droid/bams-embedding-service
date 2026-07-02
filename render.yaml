@@ -7,5 +7,7 @@ services:
     envVars:
       - key: EMBEDDING_MODEL
         value: BAAI/bge-small-en-v1.5
+      - key: LOG_LEVEL
+        value: INFO
       - key: PYTHON_VERSION
         value: 3.12.0
